@@ -1,0 +1,1599 @@
+﻿
+===== server\src\models\Task.ts =====
+
+import { Schema, model, Types, type InferSchemaType } from 'mongoose';
+
+const taskSchema = new Schema(
+  {
+    userId: { type: Types.ObjectId, ref: 'User', required: true },
+    plantId: { type: Types.ObjectId, ref: 'Plant', required: true },
+    type: { type: String, enum: ['water', 'fertilize', 'prune'], required: true },
+    dueAt: { type: Date, required: true }, // UTC
+    status: {
+      type: String,
+      enum: ['pending', 'completed'],
+      default: 'pending',
+    },
+    completedAt: { type: Date },
+    notifiedAt: { type: Date },
+  },
+  { timestamps: true },
+);
+
+// ظ„ظ„ظˆط­ط© ط§ظ„طھط­ظƒظ… ظˆط§ظ„ظ€ Cron
+// ظ„ظ„ظˆط­ط© ط§ظ„طھط­ظƒظ… ظˆط§ظ„ظ€ Cron
+taskSchema.index({ userId: 1, status: 1, dueAt: 1 });
+taskSchema.index({ status: 1, dueAt: 1, notifiedAt: 1 });
+taskSchema.index({ plantId: 1 });
+// ط¢ط®ط± ظ†ط´ط§ط·
+taskSchema.index({ userId: 1, status: 1, completedAt: -1 });
+// ظ…ظ‡ظ…ط© ظ…ط¹ظ„ظ‘ظ‚ط© ظˆط§ط­ط¯ط© ط¨ط³ ظ„ظƒظ„ (ظ†ط¨ط§طھ + ظ†ظˆط¹)
+taskSchema.index(
+  { plantId: 1, type: 1 },
+  { unique: true, partialFilterExpression: { status: 'pending' } },
+);
+
+export type TaskDoc = InferSchemaType<typeof taskSchema>;
+export const Task = model('Task', taskSchema);
+
+===== server\src\models\Plant.ts =====
+
+import { Schema, model, Types, type InferSchemaType } from 'mongoose';
+
+const careProfileSchema = new Schema(
+  {
+    wateringEveryDays: { type: Number, min: 1, max: 365 },
+    fertilizingEveryDays: { type: Number, min: 1, max: 365 },
+    pruningEveryDays: { type: Number, min: 1, max: 365 },
+    light: { type: String, maxlength: 200 },
+    notes: { type: String, maxlength: 1000 },
+  },
+  { _id: false },
+);
+
+const plantSchema = new Schema(
+  {
+    userId: { type: Types.ObjectId, ref: 'User', required: true },
+    nickname: { type: String, required: true, trim: true, maxlength: 80 },
+    species: { type: String, trim: true, maxlength: 120 },
+    imageUrl: { type: String },
+    addedAt: { type: Date, default: () => new Date() },
+    care: { type: careProfileSchema, default: {} },
+  },
+  { timestamps: true },
+);
+
+plantSchema.index({ userId: 1, createdAt: -1 });
+
+export type PlantDoc = InferSchemaType<typeof plantSchema>;
+export const Plant = model('Plant', plantSchema);
+
+===== server\src\models\GrowthLog.ts =====
+
+import { Schema, model, Types } from 'mongoose';
+
+const growthLogSchema = new Schema(
+  {
+    userId: { type: Types.ObjectId, ref: 'User', required: true },
+    plantId: { type: Types.ObjectId, ref: 'Plant', required: true },
+    imageUrl: { type: String, required: true },
+    takenAt: { type: Date, default: () => new Date() },
+    healthNote: { type: String, maxlength: 1000 }, // ظ‡ظ†ط³طھط®ط¯ظ…ظ‡ ظپظٹ ط®ط·ظˆط© ط§ظ„ظپط­طµ
+    healthStatus: { type: String, enum: ['healthy', 'needs_attention', 'unclear'] },
+  },
+  { timestamps: true },
+);
+
+growthLogSchema.index({ plantId: 1, takenAt: -1 });
+
+export const GrowthLog = model('GrowthLog', growthLogSchema);
+
+===== server\src\routes\tasks.ts =====
+
+import { Router } from 'express';
+import { z } from 'zod';
+import { Task } from '../models/Task';
+import { User } from '../models/User';
+import { AppError } from '../middleware/error';
+import { requireAuth } from '../middleware/auth';
+import { objectId } from '../utils/ids';
+import { localDayBounds } from '../utils/time';
+import { completeTask, toTaskDtos } from '../services/tasks';
+
+export const tasksRouter = Router();
+tasksRouter.use(requireAuth);
+
+const listQuery = z.object({
+  scope: z.enum(['overdue', 'today', 'upcoming', 'all']).default('all'),
+  plantId: objectId.optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+tasksRouter.get('/', async (req, res) => {
+  const userId = req.userId!;
+  const { scope, plantId, limit } = listQuery.parse(req.query);
+
+  const user = await User.findById(userId).select('timezone');
+  const { start, end } = localDayBounds(user?.timezone ?? 'UTC');
+
+  const due =
+    scope === 'overdue'
+      ? { $lt: start }
+      : scope === 'today'
+        ? { $gte: start, $lt: end }
+        : scope === 'upcoming'
+          ? { $gte: end }
+          : undefined;
+
+  const tasks = await Task.find({
+    userId,
+    status: 'pending',
+    ...(due && { dueAt: due }),
+    ...(plantId && { plantId }),
+  })
+    .sort({ dueAt: 1 })
+    .limit(limit);
+
+  res.json({ tasks: await toTaskDtos(userId, tasks) });
+});
+
+tasksRouter.post('/:id/complete', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+
+  const result = await completeTask(userId, id);
+  if (!result) {
+    throw new AppError(404, 'ط§ظ„ظ…ظ‡ظ…ط© ط؛ظٹط± ظ…ظˆط¬ظˆط¯ط© ط£ظˆ طھظ…طھ ط¨ط§ظ„ظپط¹ظ„', 'TASK_NOT_FOUND');
+  }
+
+  const [completed, next] = await Promise.all([
+    toTaskDtos(userId, [result.completed]),
+    result.next ? toTaskDtos(userId, [result.next]) : Promise.resolve([]),
+  ]);
+  res.json({ task: completed[0], next: next[0] ?? null });
+});
+
+===== server\src\routes\plants.ts =====
+
+import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+import { storageConfig } from '../config/cloudinary';
+import { Plant } from '../models/Plant';
+import { Task } from '../models/Task';
+import { AppError } from '../middleware/error';
+import { requireAuth } from '../middleware/auth';
+import { objectId } from '../utils/ids';
+import { uploadSingleImage } from '../middleware/upload';
+import { identifyPlant } from '../services/ai/identify';
+import { processImage } from '../services/images';
+import { uploadImage } from '../services/storage';
+import { syncPendingTasks, toTaskDtos } from '../services/tasks';
+import { GrowthLog } from '../models/GrowthLog';
+import { analyzeHealth, fetchStoredImage } from '../services/ai/health';
+export const plantsRouter = Router();
+plantsRouter.use(requireAuth);
+
+const intervalDays = z.number().int().min(1).max(365);
+// ط§ظ„طµظˆط± ط§ظ„ظ…ظ‚ط¨ظˆظ„ط© ظ‡ظٹ طµظˆط± Cloudinary ط¨طھط§ط¹طھظ†ط§ ط¨ط³ (ظ…ط´ ط£ظٹ ط±ط§ط¨ط· ط®ط§ط±ط¬ظٹ)
+const imageUrlSchema = z
+  .string()
+  .url()
+  .max(500)
+  .refine(
+    (u) => storageConfig !== null && u.startsWith(storageConfig.urlPrefix),
+    'ط±ط§ط¨ط· ط§ظ„طµظˆط±ط© ط؛ظٹط± ظ…ظ‚ط¨ظˆظ„',
+  );
+
+const createSchema = z.object({
+  nickname: z.string().trim().min(1).max(80),
+  species: z.string().trim().max(120).optional(),
+  imageUrl: imageUrlSchema.optional(),
+  care: z
+    .object({
+      wateringEveryDays: intervalDays.optional(),
+      fertilizingEveryDays: intervalDays.optional(),
+      pruningEveryDays: intervalDays.optional(),
+      light: z.string().trim().max(200).optional(),
+      notes: z.string().trim().max(1000).optional(),
+    })
+    .default({}),
+});
+
+// null = ط§ظ…ط³ط­ ط§ظ„ظ‚ظٹظ…ط©
+const updateSchema = z.object({
+  nickname: z.string().trim().min(1).max(80).optional(),
+  species: z.string().trim().max(120).nullable().optional(),
+  imageUrl: imageUrlSchema.nullable().optional(),
+  care: z
+    .object({
+      wateringEveryDays: intervalDays.nullable().optional(),
+      fertilizingEveryDays: intervalDays.nullable().optional(),
+      pruningEveryDays: intervalDays.nullable().optional(),
+      light: z.string().trim().max(200).nullable().optional(),
+      notes: z.string().trim().max(1000).nullable().optional(),
+    })
+    .optional(),
+});
+
+const listQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  cursor: objectId.optional(),
+});
+
+type PlantForDto = NonNullable<Awaited<ReturnType<typeof Plant.findOne>>>;
+
+function toDto(p: PlantForDto) {
+  const c = p.care;
+  return {
+    id: p.id as string,
+    nickname: p.nickname,
+    species: p.species ?? null,
+    imageUrl: p.imageUrl ?? null,
+    addedAt: p.addedAt,
+    care: {
+      wateringEveryDays: c?.wateringEveryDays ?? null,
+      fertilizingEveryDays: c?.fertilizingEveryDays ?? null,
+      pruningEveryDays: c?.pruningEveryDays ?? null,
+      light: c?.light ?? null,
+      notes: c?.notes ?? null,
+    },
+  };
+}
+// ط§ظ„ظ€ AI ط¨ظٹظƒظ„ظ‘ظپ ظپظ„ظˆط³طŒ ظپط§ظ„ط­ط¯ ظ‡ظ†ط§ ط£ط¶ظٹظ‚ ظ…ظ† ط¨ط§ظ‚ظٹ ط§ظ„ظ€ API ظˆط¨ظٹطھط­ط³ط¨ ظ„ظƒظ„ ظ…ط³طھط®ط¯ظ…
+const identifyLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.userId ?? 'anonymous',
+  message: {
+    error: { code: 'RATE_LIMIT', message: 'ظˆطµظ„طھ ظ„ظ„ط­ط¯ ط§ظ„ط£ظ‚طµظ‰ ظ„ظ„طھط¹ط±ظ‘ظپ ط¹ظ„ظ‰ ط§ظ„ظ†ط¨ط§طھط§طھطŒ ط­ط§ظˆظ„ ط¨ط¹ط¯ ط³ط§ط¹ط©' },
+  },
+});
+
+/**
+ * ط±ظپط¹ طµظˆط±ط© + طھط¹ط±ظ‘ظپ ط¹ظ„ظ‰ ط§ظ„ظ†ط¨ط§طھ. ط§ظ„ظ†طھظٹط¬ط© ط§ظ‚طھط±ط§ط­ط§طھ ط¨ط³: ط§ظ„ظ…ط³طھط®ط¯ظ… ظٹط±ط§ط¬ط¹ظ‡ط§ ظˆظٹط¹ط¯ظ‘ظ„ظ‡ط§
+ * ط«ظ… ظٹط­ظپط¸ ط§ظ„ظ†ط¨ط§طھ ط¨ظ€ POST /api/plantsطŒ ظˆظ…ظپظٹط´ ط­ط§ط¬ط© ط¨طھطھط­ظپط¸ طھظ„ظ‚ط§ط¦ظٹط§ظ‹.
+ */
+plantsRouter.post('/identify', identifyLimiter, uploadSingleImage, async (req, res) => {
+  const userId = req.userId!;
+  if (!req.file) throw new AppError(400, 'ظ„ظ… ظٹطھظ… ط±ظپط¹ طµظˆط±ط©', 'NO_FILE');
+
+  const processed = await processImage(req.file.buffer);
+  const [upload, ident] = await Promise.allSettled([
+    uploadImage(processed, userId),
+    identifyPlant(processed),
+  ]);
+
+  if (upload.status === 'rejected') throw upload.reason;
+  if (ident.status === 'rejected') console.error('Identification failed:', ident.reason);
+
+  res.json({
+    imageUrl: upload.value,
+    identification: ident.status === 'fulfilled' ? ident.value.identification : null,
+    provider: ident.status === 'fulfilled' ? ident.value.provider : null,
+  });
+});
+
+plantsRouter.post('/', async (req, res) => {
+  const userId = req.userId!;
+  const data = createSchema.parse(req.body);
+
+  const plant = await Plant.create({ ...data, userId });
+  try {
+    await syncPendingTasks(plant);
+  } catch (e) {
+    await Plant.deleteOne({ _id: plant._id });
+    throw e;
+  }
+  res.status(201).json({ plant: toDto(plant) });
+});
+
+plantsRouter.get('/', async (req, res) => {
+  const userId = req.userId!;
+  const { limit, cursor } = listQuery.parse(req.query);
+
+  const rows = await Plant.find({
+    userId,
+    ...(cursor && { _id: { $lt: cursor } }),
+  })
+    .sort({ _id: -1 })
+    .limit(limit + 1);
+
+  const page = rows.slice(0, limit);
+  res.json({
+    plants: page.map(toDto),
+    nextCursor: rows.length > limit ? (page[page.length - 1]?.id ?? null) : null,
+  });
+});
+
+plantsRouter.get('/:id', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+
+  const plant = await Plant.findOne({ _id: id, userId });
+  if (!plant) throw new AppError(404, 'ط§ظ„ظ†ط¨ط§طھ ط؛ظٹط± ظ…ظˆط¬ظˆط¯', 'PLANT_NOT_FOUND');
+
+  const pending = await Task.find({
+    plantId: plant._id,
+    userId,
+    status: 'pending',
+  }).sort({ dueAt: 1 });
+
+  res.json({
+    plant: toDto(plant),
+    tasks: await toTaskDtos(userId, pending),
+  });
+});
+
+plantsRouter.patch('/:id', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+  const patch = updateSchema.parse(req.body);
+
+  const plant = await Plant.findOne({ _id: id, userId });
+  if (!plant) throw new AppError(404, 'ط§ظ„ظ†ط¨ط§طھ ط؛ظٹط± ظ…ظˆط¬ظˆط¯', 'PLANT_NOT_FOUND');
+
+  if (patch.nickname !== undefined) plant.nickname = patch.nickname;
+  if (patch.species !== undefined) plant.set('species', patch.species ?? undefined);
+  if (patch.imageUrl !== undefined) plant.set('imageUrl', patch.imageUrl ?? undefined);
+
+  const c = patch.care;
+  if (c) {
+    for (const key of [
+      'wateringEveryDays',
+      'fertilizingEveryDays',
+      'pruningEveryDays',
+      'light',
+      'notes',
+    ] as const) {
+      if (c[key] !== undefined) plant.set(`care.${key}`, c[key] ?? undefined);
+    }
+  }
+
+  await plant.save();
+  await syncPendingTasks(plant);
+  res.json({ plant: toDto(plant) });
+});
+
+plantsRouter.delete('/:id', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+
+  const plant = await Plant.findOneAndDelete({ _id: id, userId });
+  if (!plant) throw new AppError(404, 'ط§ظ„ظ†ط¨ط§طھ ط؛ظٹط± ظ…ظˆط¬ظˆط¯', 'PLANT_NOT_FOUND');
+
+  await Task.deleteMany({ plantId: plant._id, userId });
+  await GrowthLog.deleteMany({ plantId: plant._id, userId });
+  res.status(204).end();
+});
+// ---------- ط³ط¬ظ„ ط§ظ„ظ†ظ…ظˆ ----------
+const growthLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.userId ?? 'anonymous',
+  message: { error: { code: 'RATE_LIMIT', message: 'ظˆطµظ„طھ ظ„ظ„ط­ط¯ ط§ظ„ط£ظ‚طµظ‰ ظ„ط¥ط¶ط§ظپط© ط§ظ„طµظˆط±طŒ ط­ط§ظˆظ„ ط¨ط¹ط¯ ط³ط§ط¹ط©' } },
+});
+
+type GrowthForDto = NonNullable<Awaited<ReturnType<typeof GrowthLog.findOne>>>;
+
+function toGrowthDto(g: GrowthForDto) {
+  return {
+    id: g.id as string,
+    imageUrl: g.imageUrl,
+    takenAt: g.takenAt,
+    healthNote: g.healthNote ?? null,
+    healthStatus: g.healthStatus ?? null,
+  };
+}
+
+plantsRouter.get('/:id/growth', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+
+  const plant = await Plant.exists({ _id: id, userId });
+  if (!plant) throw new AppError(404, 'ط§ظ„ظ†ط¨ط§طھ ط؛ظٹط± ظ…ظˆط¬ظˆط¯', 'PLANT_NOT_FOUND');
+
+  const logs = await GrowthLog.find({ plantId: id, userId }).sort({ takenAt: -1 }).limit(50);
+  res.json({ logs: logs.map(toGrowthDto) });
+});
+
+plantsRouter.post('/:id/growth', growthLimiter, uploadSingleImage, async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+  if (!req.file) throw new AppError(400, 'ظ„ظ… ظٹطھظ… ط±ظپط¹ طµظˆط±ط©', 'NO_FILE');
+
+  const plant = await Plant.findOne({ _id: id, userId });
+  if (!plant) throw new AppError(404, 'ط§ظ„ظ†ط¨ط§طھ ط؛ظٹط± ظ…ظˆط¬ظˆط¯', 'PLANT_NOT_FOUND');
+
+  const processed = await processImage(req.file.buffer);
+  const previousLog = await GrowthLog.findOne({ plantId: id, userId }).sort({ takenAt: -1 });
+
+  const [upload, health] = await Promise.allSettled([
+    uploadImage(processed, userId),
+    (async () => {
+      const prevImage = previousLog
+        ? await fetchStoredImage(previousLog.imageUrl).catch(() => null)
+        : null;
+      return analyzeHealth({
+        image: processed,
+        previous:
+          previousLog && prevImage
+            ? { image: prevImage, takenAt: previousLog.takenAt }
+            : undefined,
+        species: plant.species ?? undefined,
+        wateringEveryDays: plant.care?.wateringEveryDays ?? undefined,
+      });
+    })(),
+  ]);
+
+  if (upload.status === 'rejected') throw upload.reason;
+  if (health.status === 'rejected') console.error('Health check failed:', health.reason);
+
+  const log = await GrowthLog.create({
+    userId,
+    plantId: id,
+    imageUrl: upload.value,
+    ...(health.status === 'fulfilled' && {
+      healthNote: health.value.note,
+      healthStatus: health.value.status,
+    }),
+  });
+
+  res.status(201).json({ log: toGrowthDto(log) });
+});
+plantsRouter.delete('/:id/growth/:logId', async (req, res) => {
+  const userId = req.userId!;
+  const id = objectId.parse(req.params.id);
+  const logId = objectId.parse(req.params.logId);
+
+  const log = await GrowthLog.findOneAndDelete({ _id: logId, plantId: id, userId });
+  if (!log) throw new AppError(404, 'ط§ظ„طµظˆط±ط© ط؛ظٹط± ظ…ظˆط¬ظˆط¯ط©', 'GROWTH_NOT_FOUND');
+  res.status(204).end();
+});
+
+===== server\src\services\tasks.ts =====
+
+import type { Types } from 'mongoose';
+import { Plant } from '../models/Plant';
+import { Task } from '../models/Task';
+import {
+  TASK_TYPES,
+  addDays,
+  intervalFor,
+  nextDueAt,
+  type CareIntervals,
+  type TaskType,
+} from '../utils/schedule';
+
+interface PlantRef {
+  _id: Types.ObjectId;
+  userId: Types.ObjectId;
+  care?: CareIntervals | null;
+}
+
+const isDuplicateKey = (e: unknown) =>
+  typeof e === 'object' && e !== null && 'code' in e && e.code === 11000;
+
+/**
+ * ظٹط®ظ„ظ‘ظٹ ط§ظ„ظ…ظ‡ط§ظ… ط§ظ„ظ…ط¹ظ„ظ‘ظ‚ط© ظ…طھط·ط§ط¨ظ‚ط© ظ…ط¹ ظ…ظ„ظپ ط§ظ„ط¹ظ†ط§ظٹط©:
+ * ظپطھط±ط© ط§طھط´ط§ظ„طھ -> طھطھظ…ط³ط­ ط§ظ„ظ…ظ‡ظ…ط© ط§ظ„ظ…ط¹ظ„ظ‘ظ‚ط©طŒ ظˆظپطھط±ط© ط§طھط¶ط§ظپطھ -> طھطھط¹ظ…ظ„ ظ…ظ‡ظ…ط© ط¬ط¯ظٹط¯ط©.
+ * ظ…ظ‡ظ…ط© ظ…ظˆط¬ظˆط¯ط© ط¨ط§ظ„ظپط¹ظ„ ط¨طھظپط¶ظ„ ط²ظٹ ظ…ط§ ظ‡ظٹ (ط§ظ„ظپطھط±ط© ط§ظ„ط¬ط¯ظٹط¯ط© ط¨طھط·ط¨ظ‘ظ‚ ظ…ظ† ط§ظ„ظ…ظ‡ظ…ط© ط§ظ„ظ„ظٹ ط¨ط¹ط¯ظ‡ط§).
+ */
+export async function syncPendingTasks(
+  plant: PlantRef,
+  now: Date = new Date(),
+): Promise<void> {
+  const pending = await Task.find({ plantId: plant._id, status: 'pending' }).select(
+    'type',
+  );
+  const have = new Set<string>(pending.map((t) => t.type));
+
+  const toRemove: TaskType[] = [];
+  const toCreate: {
+    userId: Types.ObjectId;
+    plantId: Types.ObjectId;
+    type: TaskType;
+    dueAt: Date;
+  }[] = [];
+
+  for (const type of TASK_TYPES) {
+    const days = intervalFor(plant.care, type);
+    if (days === null && have.has(type)) toRemove.push(type);
+    if (days !== null && !have.has(type)) {
+      toCreate.push({
+        userId: plant.userId,
+        plantId: plant._id,
+        type,
+        dueAt: addDays(now, days),
+      });
+    }
+  }
+
+  if (toRemove.length > 0) {
+    await Task.deleteMany({
+      plantId: plant._id,
+      status: 'pending',
+      type: { $in: toRemove },
+    });
+  }
+  if (toCreate.length > 0) {
+    try {
+      await Task.insertMany(toCreate, { ordered: false });
+    } catch (e) {
+      // ط·ظ„ط¨ ظ…طھط²ط§ظ…ظ† ط³ط¨ظ‚ظ†ط§ ظˆط¹ظ…ظ„ ظ†ظپط³ ط§ظ„ظ…ظ‡ظ…ط©طŒ ظ…ط´ ظ…ط´ظƒظ„ط©
+      if (!isDuplicateKey(e)) throw e;
+    }
+  }
+}
+
+/**
+ * ظٹط¹ظ„ظ‘ظ… ط§ظ„ظ…ظ‡ظ…ط© طھظ…طھ ظˆظٹط¹ظ…ظ„ ط§ظ„ظ…ظ‡ظ…ط© ط§ظ„ظ„ظٹ ط¨ط¹ط¯ظ‡ط§.
+ * ط§ظ„طھط­ط¯ظٹط« ط°ط±ظٹ (status: pending ظپظٹ ط§ظ„ظپظ„طھط±)طŒ ظپظ„ظˆ ط§طھط¨ط¹طھ ط·ظ„ط¨ظٹظ†طŒ ظˆط§ط­ط¯ ط¨ط³ ط¨ظٹظƒط³ط¨.
+ */
+export async function completeTask(
+  userId: string,
+  taskId: string,
+  now: Date = new Date(),
+) {
+  const task = await Task.findOneAndUpdate(
+    { _id: taskId, userId, status: 'pending' },
+    { $set: { status: 'completed', completedAt: now } },
+    { new: true },
+  );
+  if (!task) return null;
+
+  const plant = await Plant.findOne({ _id: task.plantId, userId }).select('care');
+  let next = null;
+  if (plant) {
+    const due = nextDueAt(now, plant.care, task.type);
+    if (due) {
+      next = await Task.create({
+        userId: task.userId,
+        plantId: task.plantId,
+        type: task.type,
+        dueAt: due,
+      });
+    }
+  }
+  return { completed: task, next };
+}
+
+interface TaskLike {
+  id: string;
+  type: string;
+  status: string;
+  dueAt: Date;
+  completedAt?: Date | null;
+  plantId: Types.ObjectId;
+}
+
+/** ظٹط­ظˆظ‘ظ„ ط§ظ„ظ…ظ‡ط§ظ… ظ„ط´ظƒظ„ ط§ظ„ط±ط¯ ظˆظٹط¶ظٹظپ ط§ط³ظ… ظˆطµظˆط±ط© ط§ظ„ظ†ط¨ط§طھ (ط·ظ„ط¨ ظˆط§ط­ط¯ ظ…ط´ ط·ظ„ط¨ ظ„ظƒظ„ ظ…ظ‡ظ…ط©) */
+export async function toTaskDtos(userId: string, tasks: TaskLike[]) {
+  const ids = [...new Set(tasks.map((t) => String(t.plantId)))];
+  const plants =
+    ids.length > 0
+      ? await Plant.find({ _id: { $in: ids }, userId }).select('nickname imageUrl')
+      : [];
+  const byId = new Map(plants.map((p) => [p.id, p]));
+
+  return tasks.map((t) => {
+    const p = byId.get(String(t.plantId));
+    return {
+      id: t.id,
+      type: t.type,
+      status: t.status,
+      dueAt: t.dueAt,
+      completedAt: t.completedAt ?? null,
+      plant: p
+        ? { id: p.id, nickname: p.nickname, imageUrl: p.imageUrl ?? null }
+        : null,
+    };
+  });
+}
+
+===== server\src\utils\schedule.ts =====
+
+export const DAY_MS = 86_400_000;
+
+export const TASK_TYPES = ['water', 'fertilize', 'prune'] as const;
+export type TaskType = (typeof TASK_TYPES)[number];
+
+export const INTERVAL_FIELD = {
+  water: 'wateringEveryDays',
+  fertilize: 'fertilizingEveryDays',
+  prune: 'pruningEveryDays',
+} as const;
+
+export interface CareIntervals {
+  wateringEveryDays?: number | null;
+  fertilizingEveryDays?: number | null;
+  pruningEveryDays?: number | null;
+}
+
+export function addDays(from: Date, days: number): Date {
+  return new Date(from.getTime() + days * DAY_MS);
+}
+
+/** ط§ظ„ظپطھط±ط© ط¨ط§ظ„ط£ظٹط§ظ… ظ„ظ†ظˆط¹ ط§ظ„ظ…ظ‡ظ…ط©طŒ ط£ظˆ null ظ„ظˆ ظ…ط´ ظ…طھط­ط¯ط¯ط© ط£ظˆ ط؛ظٹط± طµط§ظ„ط­ط© */
+export function intervalFor(
+  care: CareIntervals | null | undefined,
+  type: TaskType,
+): number | null {
+  const value = care?.[INTERVAL_FIELD[type]];
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1
+    ? value
+    : null;
+}
+
+/** ط§ظ„ظ…ظˆط¹ط¯ ط§ظ„طھط§ظ„ظٹ ط¨ظٹطھط­ط³ط¨ ظ…ظ† ظˆظ‚طھ ط¥ظ†ط¬ط§ط² ط§ظ„ظ…ظ‡ظ…ط© ظپط¹ظ„ظٹط§ظ‹ ظ…ط´ ظ…ظ† ط§ظ„ظ…ظˆط¹ط¯ ط§ظ„ظ‚ط¯ظٹظ… */
+export function nextDueAt(
+  completedAt: Date,
+  care: CareIntervals | null | undefined,
+  type: TaskType,
+): Date | null {
+  const days = intervalFor(care, type);
+  return days === null ? null : addDays(completedAt, days);
+}
+
+===== server\src\utils\time.ts =====
+
+export function safeTimeZone(tz: string | null | undefined): string {
+  if (!tz) return 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return tz;
+  } catch {
+    return 'UTC';
+  }
+}
+
+/** ظپط±ظ‚ ط§ظ„طھظˆظ‚ظٹطھ (ط¨ط§ظ„ظ…ظٹظ„ظٹ ط«ط§ظ†ظٹط©) ط¨ظٹظ† ط§ظ„ظ…ظ†ط·ظ‚ط© ط§ظ„ط²ظ…ظ†ظٹط© ظˆUTC ط¹ظ†ط¯ ظ„ط­ط¸ط© ظ…ط¹ظٹظ†ط© */
+function tzOffsetMs(timeZone: string, at: Date): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
+  }).formatToParts(at);
+  const get = (type: string) =>
+    Number(parts.find((p) => p.type === type)?.value);
+  const asUtc = Date.UTC(
+    get('year'),
+    get('month') - 1,
+    get('day'),
+    get('hour'),
+    get('minute'),
+    get('second'),
+  );
+  return asUtc - Math.floor(at.getTime() / 1000) * 1000;
+}
+
+function localMidnightUtc(timeZone: string, now: Date, dayOffset: number): Date {
+  const off = tzOffsetMs(timeZone, now);
+  const local = new Date(now.getTime() + off);
+  const target = Date.UTC(
+    local.getUTCFullYear(),
+    local.getUTCMonth(),
+    local.getUTCDate() + dayOffset,
+  );
+  // ظ†ط¹ظٹط¯ ط­ط³ط§ط¨ ط§ظ„ظپط±ظ‚ ط¹ظ†ط¯ ظ„ط­ط¸ط© ظ…ظ†طھطµظپ ط§ظ„ظ„ظٹظ„ ظ†ظپط³ظ‡ط§ (ط¨ظٹطµط­ظ‘ط­ ط£ظٹط§ظ… طھط؛ظٹظٹط± ط§ظ„طھظˆظ‚ظٹطھ ط§ظ„طµظٹظپظٹ)
+  const off2 = tzOffsetMs(timeZone, new Date(target - off));
+  return new Date(target - off2);
+}
+
+/** ط¨ط¯ط§ظٹط© ظˆظ†ظ‡ط§ظٹط© ط§ظ„ظٹظˆظ… ط§ظ„ط­ط§ظ„ظٹ ط¨طھظˆظ‚ظٹطھ ط§ظ„ظ…ط³طھط®ط¯ظ…طŒ ظƒظ„ط­ط¸ط§طھ UTC */
+export function localDayBounds(
+  timeZone: string,
+  now: Date = new Date(),
+): { start: Date; end: Date } {
+  const tz = safeTimeZone(timeZone);
+  return {
+    start: localMidnightUtc(tz, now, 0),
+    end: localMidnightUtc(tz, now, 1),
+  };
+}
+
+===== server\src\app.ts =====
+
+import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import rateLimit from 'express-rate-limit';
+import { env } from './config/env';
+import { healthRouter } from './routes/health';
+import { authRouter } from './routes/auth';
+import { plantsRouter } from './routes/plants';
+import { tasksRouter } from './routes/tasks';
+import { dashboardRouter } from './routes/dashboard';
+import { errorHandler, notFound } from './middleware/error';
+import { imagesRouter } from './routes/images';
+export const app = express();
+
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+app.use(helmet());
+app.use(cors({ origin: env.CLIENT_ORIGIN, credentials: true }));
+app.use(compression());
+app.use(express.json({ limit: '100kb' }));
+app.use(cookieParser());
+
+app.use(
+  '/api',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+);
+
+app.use('/api/health', healthRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/plants', plantsRouter);
+app.use('/api/tasks', tasksRouter);
+app.use('/api/dashboard', dashboardRouter);
+app.use('/api/images', imagesRouter);
+app.use(notFound);
+app.use(errorHandler);
+
+===== client\src\lib\types.ts =====
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+export interface AuthResponse {
+  user: User;
+  accessToken: string;
+}
+
+export type TaskType = "water" | "fertilize" | "prune";
+
+export interface TaskDto {
+  id: string;
+  type: TaskType;
+  status: "pending" | "completed";
+  dueAt: string;
+  completedAt: string | null;
+  plant: { id: string; nickname: string; imageUrl: string | null } | null;
+}
+
+export interface DashboardDto {
+  counts: { plants: number; overdue: number; today: number };
+  overdue: TaskDto[];
+  today: TaskDto[];
+  recent: TaskDto[];
+}
+
+export interface PlantDto {
+  id: string;
+  nickname: string;
+  species: string | null;
+  imageUrl: string | null;
+  addedAt: string;
+  care: {
+    wateringEveryDays: number | null;
+    fertilizingEveryDays: number | null;
+    pruningEveryDays: number | null;
+    light: string | null;
+    notes: string | null;
+  };
+}
+
+export interface PlantsPage {
+  plants: PlantDto[];
+  nextCursor: string | null;
+}
+
+export interface CareSuggestion {
+  species: string;
+  commonNames: string[];
+  confidence: number;
+  care: {
+    wateringEveryDays: number;
+    fertilizingEveryDays: number | null;
+    pruningEveryDays: number | null;
+    light: string;
+    notes: string;
+  };
+}
+
+export interface IdentifyResponse {
+  imageUrl: string;
+  identification: { suggestions: CareSuggestion[]; needsBetterPhoto: boolean } | null;
+  provider: string | null;
+}
+export interface PlantDetailDto {
+  plant: PlantDto;
+  tasks: TaskDto[];
+}
+export interface GrowthLogDto {
+  id: string;
+  imageUrl: string;
+  takenAt: string;
+  healthNote: string | null;
+  healthStatus: "healthy" | "needs_attention" | "unclear" | null;
+}
+
+===== client\src\lib\api.ts =====
+
+import type { AuthResponse } from "./types";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000/api";
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+// ط§ظ„ظ€ access token ظپظٹ ط§ظ„ط°ط§ظƒط±ط© ط¨ط³ (ظ…ط´ localStorage) ط¹ط´ط§ظ† ط£ظٹ XSS ظ…ط§ظٹط§ط®ط¯ظˆط´
+let accessToken: string | null = null;
+let onSessionLost: (() => void) | null = null;
+
+export function setAccessToken(token: string | null) {
+  accessToken = token;
+}
+
+export function setSessionLostHandler(handler: (() => void) | null) {
+  onSessionLost = handler;
+}
+
+async function parseError(res: Response): Promise<ApiError> {
+  try {
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string; details?: unknown };
+    };
+    return new ApiError(
+      res.status,
+      body.error?.code ?? "ERROR",
+      body.error?.message ?? "ط­ط¯ط« ط®ط·ط£ ط؛ظٹط± ظ…طھظˆظ‚ط¹",
+      body.error?.details,
+    );
+  } catch {
+    return new ApiError(res.status, "ERROR", "ط­ط¯ط« ط®ط·ط£ ط؛ظٹط± ظ…طھظˆظ‚ط¹");
+  }
+}
+
+async function send(path: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(`${API_URL}${path}`, {
+      ...init,
+      credentials: "include",
+    });
+  } catch {
+    throw new ApiError(0, "NETWORK", "طھط¹ط°ظ‘ط± ط§ظ„ط§طھطµط§ظ„ ط¨ط§ظ„ط®ط§ط¯ظ…طŒ طھط­ظ‚ظ‚ ظ…ظ† ط§ظ„ط¥ظ†طھط±ظ†طھ");
+  }
+}
+
+function jsonInit(method: string, body?: unknown): RequestInit {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+  return {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  };
+}
+
+// ---- طھط¬ط¯ظٹط¯ ط§ظ„ط¬ظ„ط³ط© ----
+// ط·ظ„ط¨ ظˆط§ط­ط¯ ظپظ‚ط· ظپظٹ ظ†ظپط³ ط§ظ„ظˆظ‚طھ (single-flight)طŒ ظˆظ‚ظپظ„ ط¨ظٹظ† ط§ظ„طھط§ط¨ط§طھ (Web Locks)طŒ
+// ظ„ط£ظ† ط§ظ„ط³ظٹط±ظپط± ط¨ظٹظ„ط؛ظٹ ط§ظ„ط¬ظ„ط³ط© ظ„ظˆ ظ†ظپط³ ط§ظ„ظ€ refresh token ط§طھط³طھط®ط¯ظ… ظ…ط±طھظٹظ†.
+let refreshing: Promise<AuthResponse | null> | null = null;
+
+async function doRefresh(): Promise<AuthResponse | null> {
+  const res = await send("/auth/refresh", { method: "POST" });
+  if (res.status === 401) {
+    accessToken = null;
+    return null;
+  }
+  if (!res.ok) throw await parseError(res);
+  const data = (await res.json()) as AuthResponse;
+  accessToken = data.accessToken;
+  return data;
+}
+
+export function refreshSession(): Promise<AuthResponse | null> {
+  if (!refreshing) {
+    const run: () => Promise<AuthResponse | null> =
+      typeof navigator !== "undefined" && navigator.locks
+        ? async () => await navigator.locks.request("nabtety-refresh", doRefresh)
+        : doRefresh;
+    const promise = run().finally(() => {
+      refreshing = null;
+    });
+    refreshing = promise;
+    return promise;
+  }
+  return refreshing;
+}
+
+export async function api<T>(
+  path: string,
+  options: { method?: string; body?: unknown } = {},
+): Promise<T> {
+  const method = options.method ?? "GET";
+  let res = await send(path, jsonInit(method, options.body));
+
+  if (res.status === 401 && !path.startsWith("/auth/")) {
+    const session = await refreshSession();
+    if (!session) {
+      onSessionLost?.();
+      throw await parseError(res);
+    }
+    res = await send(path, jsonInit(method, options.body));
+  }
+
+  if (!res.ok) throw await parseError(res);
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export async function authRequest(
+  path: "/auth/login" | "/auth/register",
+  body: unknown,
+): Promise<AuthResponse> {
+  const res = await send(path, jsonInit("POST", body));
+  if (!res.ok) throw await parseError(res);
+  const data = (await res.json()) as AuthResponse;
+  accessToken = data.accessToken;
+  return data;
+}
+
+export async function logoutRequest(): Promise<void> {
+  try {
+    await send("/auth/logout", jsonInit("POST"));
+  } finally {
+    accessToken = null;
+  }
+}
+export async function uploadRequest<T>(path: string, form: FormData): Promise<T> {
+  const doSend = () => {
+    const headers: Record<string, string> = {};
+    if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+    return send(path, { method: "POST", headers, body: form });
+  };
+
+  let res = await doSend();
+  if (res.status === 401) {
+    const session = await refreshSession();
+    if (!session) {
+      onSessionLost?.();
+      throw await parseError(res);
+    }
+    res = await doSend();
+  }
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as T;
+}
+
+===== client\src\lib\tasks.ts =====
+
+import { Droplets, Leaf, Scissors, type LucideIcon } from "lucide-react";
+import type { TaskType } from "./types";
+
+export const TASK_META: Record<
+  TaskType,
+  { label: string; icon: LucideIcon; tone: string }
+> = {
+  water: {
+    label: "ط±ظٹ",
+    icon: Droplets,
+    tone: "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300",
+  },
+  fertilize: {
+    label: "طھط³ظ…ظٹط¯",
+    icon: Leaf,
+    tone: "bg-lime-100 text-lime-900 dark:bg-lime-950 dark:text-lime-300",
+  },
+  prune: {
+    label: "طھظ‚ظ„ظٹظ…",
+    icon: Scissors,
+    tone: "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-300",
+  },
+};
+
+const dateFormat = new Intl.DateTimeFormat("ar-EG-u-nu-latn", {
+  day: "numeric",
+  month: "short",
+});
+
+export function formatDue(iso: string): string {
+  return dateFormat.format(new Date(iso));
+}
+
+===== client\src\components\app\plants-view.tsx =====
+
+"use client";
+
+import Link from "next/link";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { CircleAlert, LoaderCircle, Plus, Sprout, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { api } from "@/lib/api";
+import type { PlantsPage } from "@/lib/types";
+
+export function PlantsView() {
+  const query = useInfiniteQuery({
+    queryKey: ["plants"],
+    queryFn: ({ pageParam }) =>
+      api<PlantsPage>(`/plants?limit=20${pageParam ? `&cursor=${pageParam}` : ""}`),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.nextCursor,
+  });
+
+  const plants = query.data?.pages.flatMap((p) => p.plants) ?? [];
+
+  const queryClient = useQueryClient();
+  const remove = useMutation({
+    mutationFn: (id: string) => api(`/plants/${id}`, { method: "DELETE" }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["plants"] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+  const deletingId = remove.isPending ? remove.variables : null;
+
+  return (
+    <div className="space-y-6 motion-safe:animate-rise">
+      <header className="flex items-center justify-between gap-4">
+        <h1 className="font-display text-3xl font-bold sm:text-4xl">ظ†ط¨ط§طھط§طھظٹ</h1>
+        <Link
+          href="/plants/new"
+          className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-bold text-primary-foreground"
+        >
+          <Plus className="size-5" />
+          ط¥ط¶ط§ظپط© ظ†ط¨طھط©
+        </Link>
+      </header>
+
+      {query.isPending ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <Skeleton key={i} className="h-56" />
+          ))}
+        </div>
+      ) : null}
+
+      {query.isError ? (
+        <Card className="flex flex-col items-center gap-4 p-10 text-center">
+          <CircleAlert className="size-10 text-destructive" />
+          <p className="text-muted-foreground">{query.error.message}</p>
+          <Button variant="outline" onClick={() => query.refetch()}>
+            ط¥ط¹ط§ط¯ط© ط§ظ„ظ…ط­ط§ظˆظ„ط©
+          </Button>
+        </Card>
+      ) : null}
+
+      {query.data && plants.length === 0 ? (
+        <Card className="flex flex-col items-center gap-3 p-10 text-center">
+          <Sprout className="size-10 text-primary" />
+          <p className="text-lg font-bold">ظ„ظ… طھط¶ظپ ط£ظٹ ظ†ط¨طھط© ط¨ط¹ط¯</p>
+        </Card>
+      ) : null}
+
+      {remove.isError ? (
+        <p role="alert" className="rounded-xl bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">
+          {remove.error.message}
+        </p>
+      ) : null}
+
+      {plants.length > 0 ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {plants.map((p) => (
+            <Card key={p.id} className="flex flex-col overflow-hidden">
+              <Link href={`/plants/${p.id}`} className="block flex-1">
+                <div className="grid h-40 place-items-center bg-secondary">
+                  {p.imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={p.imageUrl} alt={p.nickname} className="h-full w-full object-cover" />
+                  ) : (
+                    <Sprout className="size-12 text-primary" />
+                  )}
+                </div>
+                <div className="space-y-1 p-4">
+                  <p className="truncate text-lg font-bold">{p.nickname}</p>
+                  {p.species ? <p className="truncate text-sm text-muted-foreground">{p.species}</p> : null}
+                  <p className="text-sm text-muted-foreground">
+                    {p.care.wateringEveryDays ? `ط±ظٹ ظƒظ„ ${p.care.wateringEveryDays} ظٹظˆظ…` : "ط¨ط¯ظˆظ† ط¬ط¯ظˆظ„ ط±ظٹ"}
+                  </p>
+                </div>
+              </Link>
+              <div className="border-t border-border px-4 py-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="text-destructive"
+                  disabled={deletingId === p.id}
+                  onClick={() => {
+                    if (window.confirm(`ظ‡ظ„ طھط±ظٹط¯ ط­ط°ظپ "${p.nickname}" ظ†ظ‡ط§ط¦ظٹط§ظ‹ ظ…ط¹ ظƒظ„ ظ…ظ‡ط§ظ…ظ‡ط§طں`)) remove.mutate(p.id);
+                  }}
+                >
+                  {deletingId === p.id ? <LoaderCircle className="animate-spin" /> : <Trash2 />}
+                  ط­ط°ظپ
+                </Button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      ) : null}
+
+      {query.hasNextPage ? (
+        <div className="text-center">
+          <Button variant="outline" onClick={() => query.fetchNextPage()} disabled={query.isFetchingNextPage}>
+            {query.isFetchingNextPage ? "ط¬ط§ط±ظچ ط§ظ„طھط­ظ…ظٹظ„..." : "ط¹ط±ط¶ ط§ظ„ظ…ط²ظٹط¯"}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+===== client\src\components\app\plant-detail.tsx =====
+
+"use client";
+
+import Link from "next/link";
+import { useParams, useRouter } from "next/navigation";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, CircleAlert, LoaderCircle, Pencil, Sprout, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { api } from "@/lib/api";
+import { formatDue, TASK_META } from "@/lib/tasks";
+import type { PlantDetailDto } from "@/lib/types";
+import { GrowthTimeline } from "@/components/app/growth-timeline";
+export function PlantDetail() {
+  const { id } = useParams<{ id: string }>();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+
+  const query = useQuery({
+    queryKey: ["plant", id],
+    queryFn: () => api<PlantDetailDto>(`/plants/${id}`),
+  });
+
+  const remove = useMutation({
+    mutationFn: () => api(`/plants/${id}`, { method: "DELETE" }),
+    onSuccess: async () => {
+      queryClient.removeQueries({ queryKey: ["plant", id] });
+      await queryClient.invalidateQueries({ queryKey: ["plants"] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      router.replace("/plants");
+    },
+  });
+
+  function onDelete(nickname: string) {
+    if (window.confirm(`ظ‡ظ„ طھط±ظٹط¯ ط­ط°ظپ "${nickname}" ظ†ظ‡ط§ط¦ظٹط§ظ‹ ظ…ط¹ ظƒظ„ ظ…ظ‡ط§ظ…ظ‡ط§طں`)) {
+      remove.mutate();
+    }
+  }
+
+  const data = query.data;
+  const care = data?.plant.care;
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6 motion-safe:animate-rise">
+      <Link href="/plants" className="inline-flex items-center gap-1.5 font-semibold text-muted-foreground hover:text-foreground">
+        <ArrowRight className="size-4" />
+        ظ†ط¨ط§طھط§طھظٹ
+      </Link>
+
+      {query.isPending ? <Skeleton className="h-80" /> : null}
+
+      {query.isError ? (
+        <Card className="flex flex-col items-center gap-4 p-10 text-center">
+          <CircleAlert className="size-10 text-destructive" />
+          <p className="text-muted-foreground">{query.error.message}</p>
+          <Button variant="outline" onClick={() => router.push("/plants")}>
+            ط§ظ„ط¹ظˆط¯ط© ظ„ظ„ظ‚ط§ط¦ظ…ط©
+          </Button>
+        </Card>
+      ) : null}
+
+      {data && care ? (
+        <>
+          <Card className="overflow-hidden">
+            <div className="grid h-56 place-items-center bg-secondary">
+              {data.plant.imageUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={data.plant.imageUrl} alt={data.plant.nickname} className="h-full w-full object-cover" />
+              ) : (
+                <Sprout className="size-16 text-primary" />
+              )}
+            </div>
+            <div className="space-y-4 p-6">
+              <div>
+                <h1 className="font-display text-3xl font-bold">{data.plant.nickname}</h1>
+                {data.plant.species ? (
+                  <p dir="ltr" className="mt-1 text-start text-muted-foreground">
+                    {data.plant.species}
+                  </p>
+                ) : null}
+              </div>
+
+              <dl className="grid gap-3 text-sm sm:grid-cols-3">
+                {[
+                  ["ط§ظ„ط±ظٹ", care.wateringEveryDays],
+                  ["ط§ظ„طھط³ظ…ظٹط¯", care.fertilizingEveryDays],
+                  ["ط§ظ„طھظ‚ظ„ظٹظ…", care.pruningEveryDays],
+                ].map(([label, value]) => (
+                  <div key={label as string} className="rounded-xl bg-secondary px-4 py-3">
+                    <dt className="text-muted-foreground">{label}</dt>
+                    <dd className="font-bold">{value ? `ظƒظ„ ${value} ظٹظˆظ…` : "ط؛ظٹط± ظ…ط­ط¯ط¯"}</dd>
+                  </div>
+                ))}
+              </dl>
+
+              {care.light ? (
+                <p>
+                  <span className="font-bold">ط§ظ„ط¥ط¶ط§ط،ط©: </span>
+                  {care.light}
+                </p>
+              ) : null}
+              {care.notes ? (
+                <p>
+                  <span className="font-bold">ظ…ظ„ط§ط­ط¸ط§طھ: </span>
+                  {care.notes}
+                </p>
+              ) : null}
+            </div>
+          </Card>
+
+          <section>
+            <h2 className="mb-3 font-display text-2xl font-bold">ط§ظ„ظ…ظ‡ط§ظ… ط§ظ„ظ‚ط§ط¯ظ…ط©</h2>
+            <Card className="divide-y divide-border px-5">
+              {data.tasks.length === 0 ? (
+                <p className="py-8 text-center text-muted-foreground">ظ„ط§ طھظˆط¬ط¯ ظ…ظ‡ط§ظ… ظ…ط¹ظ„ظ‘ظ‚ط©</p>
+              ) : (
+                data.tasks.map((t) => {
+                  const meta = TASK_META[t.type];
+                  const Icon = meta.icon;
+                  return (
+                    <div key={t.id} className="flex items-center gap-3 py-3.5">
+                      <span className={`grid size-10 shrink-0 place-items-center rounded-xl ${meta.tone}`}>
+                        <Icon className="size-5" />
+                      </span>
+                      <div>
+                        <p className="font-bold">{meta.label}</p>
+                        <p className="text-sm text-muted-foreground">ط§ظ„ظ…ظˆط¹ط¯: {formatDue(t.dueAt)}</p>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </Card>
+          </section>
+          <GrowthTimeline plantId={data.plant.id} />
+
+          {remove.isError ? (
+            <p role="alert" className="rounded-xl bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">
+              {remove.error.message}
+            </p>
+          ) : null}
+
+          <div className="flex flex-wrap gap-3">
+            <Link
+              href={`/plants/${id}/edit`}
+              className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-bold text-primary-foreground"
+            >
+              <Pencil className="size-5" />
+              طھط¹ط¯ظٹظ„
+            </Link>
+            <Button
+              variant="outline"
+              className="text-destructive"
+              onClick={() => onDelete(data.plant.nickname)}
+              disabled={remove.isPending}
+            >
+              {remove.isPending ? <LoaderCircle className="animate-spin" /> : <Trash2 />}
+              ط­ط°ظپ ط§ظ„ظ†ط¨طھط©
+            </Button>
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+===== client\src\components\app\tasks-view.tsx =====
+
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { CalendarCheck, Check, CircleAlert, LoaderCircle, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { api } from "@/lib/api";
+import { formatDue, TASK_META } from "@/lib/tasks";
+import type { TaskDto } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+type Scope = "all" | "overdue" | "today" | "upcoming";
+
+const TABS: { value: Scope; label: string; empty: string }[] = [
+  { value: "all", label: "ط§ظ„ظƒظ„", empty: "ظ„ط§ طھظˆط¬ط¯ ظ…ظ‡ط§ظ… ظ…ط¹ظ„ظ‘ظ‚ط©" },
+  { value: "overdue", label: "ظ…طھط£ط®ط±ط©", empty: "ظ„ط§ طھظˆط¬ط¯ ظ…ظ‡ط§ظ… ظ…طھط£ط®ط±ط©طŒ ط£ط­ط³ظ†طھ!" },
+  { value: "today", label: "ط§ظ„ظٹظˆظ…", empty: "ظ„ط§ طھظˆط¬ط¯ ظ…ظ‡ط§ظ… ط§ظ„ظٹظˆظ…" },
+  { value: "upcoming", label: "ظ‚ط§ط¯ظ…ط©", empty: "ظ„ط§ طھظˆط¬ط¯ ظ…ظ‡ط§ظ… ظ‚ط§ط¯ظ…ط©" },
+];
+
+export function TasksView() {
+  const [scope, setScope] = useState<Scope>("all");
+  const queryClient = useQueryClient();
+
+  const query = useQuery({
+    queryKey: ["tasks", scope],
+    queryFn: () => api<{ tasks: TaskDto[] }>(`/tasks?scope=${scope}`),
+  });
+
+  const complete = useMutation({
+    mutationFn: (id: string) => api(`/tasks/${id}/complete`, { method: "POST" }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["plant"] }),
+      ]);
+    },
+  });
+
+  const busyId = complete.isPending ? complete.variables : null;
+  const tasks = query.data?.tasks ?? [];
+  const current = TABS.find((t) => t.value === scope)!;
+  const now = Date.now();
+
+  return (
+    <div className="space-y-6 motion-safe:animate-rise">
+      <header>
+        <h1 className="font-display text-3xl font-bold sm:text-4xl">ط§ظ„ظ…ظ‡ط§ظ…</h1>
+        <p className="mt-1.5 text-lg text-muted-foreground">ظƒظ„ ظ…ظ‡ط§ظ… ط§ظ„ط¹ظ†ط§ظٹط© ط¨ظ†ط¨ط§طھط§طھظƒ ظپظٹ ظ…ظƒط§ظ† ظˆط§ط­ط¯.</p>
+      </header>
+
+      <div role="tablist" aria-label="طھطµظپظٹط© ط§ظ„ظ…ظ‡ط§ظ…" className="flex flex-wrap gap-2">
+        {TABS.map((t) => (
+          <button
+            key={t.value}
+            role="tab"
+            aria-selected={scope === t.value}
+            onClick={() => setScope(t.value)}
+            className={cn(
+              "rounded-full px-4 py-2 text-sm font-bold transition-colors",
+              scope === t.value
+                ? "bg-primary text-primary-foreground"
+                : "bg-secondary text-secondary-foreground hover:bg-secondary/70",
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {complete.isError ? (
+        <p role="alert" className="rounded-xl bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">
+          {complete.error.message}
+        </p>
+      ) : null}
+
+      {query.isPending ? <Skeleton className="h-64" /> : null}
+
+      {query.isError ? (
+        <Card className="flex flex-col items-center gap-4 p-10 text-center">
+          <CircleAlert className="size-10 text-destructive" />
+          <p className="text-muted-foreground">{query.error.message}</p>
+          <Button variant="outline" onClick={() => query.refetch()} disabled={query.isFetching}>
+            <RefreshCw className={cn(query.isFetching && "animate-spin")} />
+            ط¥ط¹ط§ط¯ط© ط§ظ„ظ…ط­ط§ظˆظ„ط©
+          </Button>
+        </Card>
+      ) : null}
+
+      {query.data && tasks.length === 0 ? (
+        <Card className="flex flex-col items-center gap-3 p-10 text-center">
+          <CalendarCheck className="size-10 text-primary" />
+          <p className="text-lg font-bold">{current.empty}</p>
+        </Card>
+      ) : null}
+
+      {tasks.length > 0 ? (
+        <Card className="divide-y divide-border px-5">
+          {tasks.map((t) => {
+            const meta = TASK_META[t.type];
+            const Icon = meta.icon;
+            const late = new Date(t.dueAt).getTime() < now && scope !== "upcoming";
+            return (
+              <div key={t.id} className="flex items-center gap-3 py-3.5">
+                <span className={cn("grid size-11 shrink-0 place-items-center rounded-xl", meta.tone)}>
+                  <Icon className="size-5" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-bold">
+                    {meta.label}{" "}
+                    {t.plant ? (
+                      <Link href={`/plants/${t.plant.id}`} className="font-medium text-muted-foreground hover:underline">
+                        â€” {t.plant.nickname}
+                      </Link>
+                    ) : (
+                      <span className="font-medium text-muted-foreground">â€” ظ†ط¨ط§طھ ظ…ط­ط°ظˆظپ</span>
+                    )}
+                  </p>
+                  <p className={cn("text-sm", late ? "font-semibold text-destructive" : "text-muted-foreground")}>
+                    ط§ظ„ظ…ظˆط¹ط¯: {formatDue(t.dueAt)}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => complete.mutate(t.id)}
+                  disabled={busyId === t.id}
+                  aria-label={`طھظ…: ${meta.label} ${t.plant?.nickname ?? ""}`}
+                >
+                  {busyId === t.id ? <LoaderCircle className="animate-spin" /> : <Check />}
+                  طھظ…ظ‘
+                </Button>
+              </div>
+            );
+          })}
+        </Card>
+      ) : null}
+    </div>
+  );
+}
+
+===== client\src\components\app\growth-timeline.tsx =====
+
+"use client";
+
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Camera, LoaderCircle, Stethoscope, Trash2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { api, uploadRequest } from "@/lib/api";
+import type { GrowthLogDto } from "@/lib/types";
+
+const dateFormat = new Intl.DateTimeFormat("ar-EG-u-nu-latn", {
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+});
+const HEALTH_TONE = {
+  healthy: "bg-lime-100 text-lime-900 dark:bg-lime-950 dark:text-lime-300",
+  needs_attention: "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-300",
+  unclear: "bg-muted text-muted-foreground",
+} as const;
+
+export function GrowthTimeline({ plantId }: { plantId: string }) {
+  const queryClient = useQueryClient();
+  const [localError, setLocalError] = useState<string | null>(null);
+  const key = ["growth", plantId];
+
+  const query = useQuery({
+    queryKey: key,
+    queryFn: () => api<{ logs: GrowthLogDto[] }>(`/plants/${plantId}/growth`),
+  });
+
+  const add = useMutation({
+    mutationFn: (file: File) => {
+      const fd = new FormData();
+      fd.append("image", file);
+      return uploadRequest<{ log: GrowthLogDto }>(`/plants/${plantId}/growth`, fd);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: key }),
+  });
+
+  const remove = useMutation({
+    mutationFn: (logId: string) => api(`/plants/${plantId}/growth/${logId}`, { method: "DELETE" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: key }),
+  });
+
+  const deletingId = remove.isPending ? remove.variables : null;
+  const logs = query.data?.logs ?? [];
+  const latest = logs[0];
+  const error = localError ?? (add.isError ? add.error.message : null) ?? (remove.isError ? remove.error.message : null);
+
+  function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setLocalError(null);
+    if (file.size > 5 * 1024 * 1024) return setLocalError("ط­ط¬ظ… ط§ظ„طµظˆط±ط© ط£ظƒط¨ط± ظ…ظ† 5MB");
+    add.mutate(file);
+  }
+
+  return (
+    <section>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 className="font-display text-2xl font-bold">ط³ط¬ظ„ ط§ظ„ظ†ظ…ظˆ</h2>
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm font-bold hover:bg-secondary">
+          {add.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Camera className="size-4" />}
+          {add.isPending ? "ط¬ط§ط±ظچ ط§ظ„ط±ظپط¹ ظˆط§ظ„ظپط­طµ..." : "ط£ط¶ظپ طµظˆط±ط©"}
+          <input type="file" accept="image/*" className="sr-only" onChange={onPick} disabled={add.isPending} />
+        </label>
+      </div>
+
+      {error ? (
+        <p role="alert" className="mb-3 rounded-xl bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">
+          {error}
+        </p>
+      ) : null}
+
+      {latest?.healthNote ? (
+        <Card className={cn("mb-4 space-y-1.5 p-5", HEALTH_TONE[latest.healthStatus ?? "unclear"])}>
+          <p className="flex items-center gap-2 font-bold">
+            <Stethoscope className="size-5" />
+            ظ†طµظٹط­ط© 
+          </p>
+          <p className="leading-7">{latest.healthNote}</p>
+          <p className="text-xs opacity-80">ط§ظ‚طھط±ط§ط­ ظپظ‚ط· ظˆظ„ظٹط³ طھط´ط®ظٹطµط§ظ‹ ظ†ظ‡ط§ط¦ظٹط§ظ‹طŒ ظˆظ„ط§ ظٹط؛ظٹظ‘ط± ط¬ط¯ظˆظ„ ط§ظ„ط¹ظ†ط§ظٹط©.</p>
+        </Card>
+      ) : null}
+
+      {query.isPending ? <Skeleton className="h-40" /> : null}
+      {query.isError ? <p className="text-muted-foreground">{query.error.message}</p> : null}
+
+      {query.data && logs.length === 0 ? (
+        <Card className="p-8 text-center text-muted-foreground">
+          ظ„ط§ طھظˆط¬ط¯ طµظˆط± ط¨ط¹ط¯. ط£ط¶ظپ طµظˆط±ط© ظƒظ„ ظپطھط±ط© ظ„طھطھط§ط¨ط¹ ظ†ظ…ظˆ ظ†ط¨طھطھظƒ.
+        </Card>
+      ) : null}
+
+      {logs.length > 0 ? (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          {logs.map((g) => (
+            <Card key={g.id} className="overflow-hidden">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={g.imageUrl} alt={`طµظˆط±ط© ط¨طھط§ط±ظٹط® ${dateFormat.format(new Date(g.takenAt))}`} className="aspect-square w-full object-cover" />
+              <div className="flex items-center justify-between gap-2 px-3 py-2">
+                <span className="text-sm text-muted-foreground">{dateFormat.format(new Date(g.takenAt))}</span>
+                <button
+                  type="button"
+                  aria-label="ط­ط°ظپ ط§ظ„طµظˆط±ط©"
+                  disabled={deletingId === g.id}
+                  onClick={() => {
+                    if (window.confirm("ظ‡ظ„ طھط±ظٹط¯ ط­ط°ظپ ظ‡ط°ظ‡ ط§ظ„طµظˆط±ط©طں")) remove.mutate(g.id);
+                  }}
+                  className="text-destructive disabled:opacity-50"
+                >
+                  {deletingId === g.id ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                </button>
+              </div>
+              {g.healthNote ? (
+                <p className="line-clamp-2 px-3 pb-2 text-xs text-muted-foreground" title={g.healthNote}>
+                  {g.healthNote}
+                </p>
+              ) : null}
+            </Card>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}

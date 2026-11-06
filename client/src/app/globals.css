@@ -1,0 +1,146 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ألوان النظام: ورق كريمي + أخضر غابات + طين محروق */
+:root {
+  --background: #f6f1e7;
+  --foreground: #1c2a21;
+  --card: #fffdf8;
+  --card-foreground: #1c2a21;
+  --primary: #2f5d3a;
+  --primary-foreground: #f8f4ea;
+  --secondary: #e1e9d9;
+  --secondary-foreground: #24432c;
+  --muted: #ece5d5;
+  --muted-foreground: #5b675c;
+  --accent: #c4623a;
+  --accent-foreground: #fff8f0;
+  --border: #ddd4c0;
+  --input: #cfc5ae;
+  --ring: #2f5d3a;
+  --destructive: #b3372c;
+  --leaf-1: #2f5d3a;
+  --leaf-2: #4a7c52;
+  --leaf-3: #7aa57b;
+  --leaf-4: #a9c8a0;
+  --pot: #c4623a;
+  --pot-dark: #a24d2b;
+  --soil: #4b3a2c;
+}
+
+.dark {
+  --background: #0f1812;
+  --foreground: #ece7da;
+  --card: #16231b;
+  --card-foreground: #ece7da;
+  --primary: #86c08f;
+  --primary-foreground: #0f1812;
+  --secondary: #1f3326;
+  --secondary-foreground: #cfe6d2;
+  --muted: #1a2a20;
+  --muted-foreground: #a5b5a8;
+  --accent: #e08a62;
+  --accent-foreground: #1c0f08;
+  --border: #29392f;
+  --input: #35483b;
+  --ring: #86c08f;
+  --destructive: #f07a6e;
+  --leaf-1: #5f9b69;
+  --leaf-2: #78b183;
+  --leaf-3: #9ccaa3;
+  --leaf-4: #c2e0c6;
+  --pot: #d97a50;
+  --pot-dark: #b9603a;
+  --soil: #2a2018;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --font-sans: "Cairo Variable", ui-sans-serif, system-ui, "Segoe UI", Tahoma, sans-serif;
+  --font-display: "Reem Kufi Variable", "Cairo Variable", ui-sans-serif, system-ui, sans-serif;
+  --animate-rise: rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  --animate-sway: sway 7s ease-in-out infinite;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes sway {
+  0%,
+  100% {
+    transform: rotate(-1.2deg);
+  }
+  50% {
+    transform: rotate(1.2deg);
+  }
+}
+
+html {
+  color-scheme: light;
+  scroll-behavior: smooth;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+    overflow-x: clip;
+
+  background-color: var(--background);
+  background-image:
+    radial-gradient(60rem 30rem at 85% -10%, color-mix(in oklab, var(--leaf-4) 28%, transparent), transparent),
+    radial-gradient(40rem 24rem at -10% 40%, color-mix(in oklab, var(--accent) 7%, transparent), transparent);
+  background-attachment: fixed;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--primary) 28%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
