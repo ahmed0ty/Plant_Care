@@ -18,6 +18,11 @@ const nextConfig: NextConfig = {
       { protocol: "https", hostname: "res.cloudinary.com", pathname: "/**" },
     ],
   },
+  // الـ API بيتفتح من نفس دومين الموقع (/api/*) عشان الـ refresh cookie تبقى first-party
+  async rewrites() {
+    const apiOrigin = process.env.API_ORIGIN ?? "http://localhost:4000";
+    return [{ source: "/api/:path*", destination: `${apiOrigin}/api/:path*` }];
+  },
   async headers() {
     return [
       {
